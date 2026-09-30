@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""
+ABG - a simple arterial / venous blood gas analyzer.
+
+Usage:
+    ./ABG <pH> <pCO2> <pO2> <HCO3> [options]
+    ./ABG --ph 7.30 --pco2 50 --po2 80 --hco3 24
+    ./ABG                      (interactive prompts)
+
+Options:
+    --vbg                interpret as a venous sample
+    --na  <mEq/L>        sodium    (with --cl: anion gap / delta ratio)
+    --cl  <mEq/L>        chloride
+    --albumin <g/dL>     albumin   (corrects the anion gap)
+    --age <years>        age       (with --fio2: A-a gradient)
+    --fio2 <0.21-1.0>    inspired O2 fraction (default 0.21 when --age given)
+    -h, --help           show this help
+
+Units: pCO2 / pO2 in mmHg, HCO3 in mEq/L.
+"""
+
+import argparse
+import sys
+
+# --------------------------------------------------------------------------
+# Reference ranges and compensation rules
+# --------------------------------------------------------------------------
+PH_LOW, PH_HIGH = 7.35, 7.45
+PCO2_LOW, PCO2_HIGH = 35.0, 45.0
+HCO3_LOW, HCO3_HIGH = 22.0, 26.0
+PH_MID, PCO2_MID, HCO3_MID = 7.40, 40.0, 24.0
+
+WINTERS_TOL = 2.0      # metabolic acidosis: pCO2 = 1.5*HCO3 + 8 +/- 2
+MET_ALK_TOL = 5.0      # metabolic alkalosis: pCO2 = 40 + 0.7*(HCO3-24) +/- 5
+RESP_TOL = 2.0         # respiratory: expected HCO3 +/- 2
+HH_TOL = 3.0           # Henderson-Hasselbalch consistency tolerance (mEq/L)
+
+
+def fmt(x, nd=1):
+    return f"{x:.{nd}f}"
+
+
+def rng(lo, hi, nd=1):
+    return f"{fmt(lo, nd)}-{fmt(hi, nd)}"
+
+
+# --------------------------------------------------------------------------
+# Core analysis
+# --------------------------------------------------------------------------
+def analyze(ph, pco2, po2, hco3, vbg=False, na=None, cl=None, albumin=None,
+            age=None, fio2=None):
+    out = []          # lines of report
+    notes = []        # caveats
+    comp_lines = []   # compensation-formula detail lines
+
+    # ---- Henderson-Hasselbalch internal consistency ----------------------
+    hco3_calc = 0.03 * pco2 * 10 ** (ph - 6.1)
+    if abs(hco3_calc - hco3) > HH_TOL:
+        notes.append(
+            f"Values are internally inconsistent: from pH and pCO2 the expected "
+            f"HCO3 is ~{fmt(hco3_calc)} mEq/L but {fmt(hco3)} was entered "
+            f"(difference > {fmt(HH_TOL, 0)}). Check for a transcription error "
+            f"or sampling problem; the interpretation below may be unreliable."
+        )
+
+    # ---- Step 1: acidemia / alkalemia ------------------------------------
+    if ph < PH_LOW:
+        status = "Acidemia"
+    elif ph > PH_HIGH:
+        status = "Alkalemia"
+    else:
+        status = "Normal pH"
+
+    # ---- Step 2: primary disorder ----------------------------------------
+    resp_acid = pco2 > PCO2_HIGH
+    resp_alk = pco2 < PCO2_LOW
+    met_acid = hco3 < HCO3_LOW
+    met_alk = hco3 > HCO3_HIGH
+
+    primary = None
+    mixed_primary = False
+    borderline_note = ("pCO2 and HCO3 are both within their reference ranges; "
+                       "the primary process was assigned from their deviation "
+                       "from 40 mmHg / 24 mEq/L.")
+
+    if status == "Acidemia":
+        if resp_acid and met_acid:
+            primary = "Mixed respiratory and metabolic acidosis"
+            mixed_primary = True
+        elif resp_acid:
+            primary = "Respiratory acidosis"
+        elif met_acid:
+            primary = "Metabolic acidosis"
+        else:
+            primary = ("Respiratory acidosis" if (pco2 - PCO2_MID) / 5 >
+                       (HCO3_MID - hco3) / 2 else "Metabolic acidosis")
+            notes.append(borderline_note)
+    elif status == "Alkalemia":
+        if resp_alk and met_alk:
+            primary = "Mixed respiratory and metabolic alkalosis"
+            mixed_primary = True
+        elif resp_alk:
+            primary = "Respiratory alkalosis"
+        elif met_alk:
+            primary = "Metabolic alkalosis"
+        else:
+            primary = ("Respiratory alkalosis" if (PCO2_MID - pco2) / 5 >
+                       (hco3 - HCO3_MID) / 2 else "Metabolic alkalosis")
+            notes.append(borderline_note)
+    else:  # normal pH
+        side = "acid" if ph < PH_MID else "alkaline"
+        if not (resp_acid or resp_alk or met_acid or met_alk):
+            primary = "None"
+        elif resp_acid and met_alk:
+            primary = ("Respiratory acidosis" if ph < PH_MID
+                       else "Metabolic alkalosis")
+            notes.append("Normal pH with elevated pCO2 and HCO3: either a "
+                         "fully compensated chronic respiratory acidosis or a "
+                         "metabolic alkalosis with respiratory compensation "
+                         f"(or both). pH on the {side} side of 7.40 favours "
+                         "the disorder named as primary.")
+        elif resp_alk and met_acid:
+            primary = ("Metabolic acidosis" if ph < PH_MID
+                       else "Respiratory alkalosis")
+            notes.append("Normal pH with low pCO2 and low HCO3: either a "
+                         "fully compensated chronic respiratory alkalosis or "
+                         "a metabolic acidosis with respiratory compensation "
+                         f"(or both). pH on the {side} side of 7.40 favours "
+                         "the disorder named as primary.")
+        elif resp_acid and met_acid:
+            primary = "Mixed respiratory and metabolic acidosis"
+            mixed_primary = True
+            notes.append("Normal pH with elevated pCO2 and low HCO3 is "
+                         "physiologically improbable; check the values.")
+        elif resp_alk and met_alk:
+            primary = "Mixed respiratory and metabolic alkalosis"
+            mixed_primary = True
+            notes.append("Normal pH with low pCO2 and high HCO3 is "
+                         "physiologically improbable; check the values.")
+        elif resp_acid:
+            primary = "Respiratory acidosis"
+        elif resp_alk:
+            primary = "Respiratory alkalosis"
+        elif met_acid:
+            primary = "Metabolic acidosis"
+        else:
+            primary = "Metabolic alkalosis"
+
+    # ---- Step 3: compensation --------------------------------------------
+    compensation = "Not applicable"
+    final = primary
+
+    if primary == "None":
+        final = "Normal acid-base status"
+        compensation = "Not applicable (no primary disorder)"
+
+    elif mixed_primary:
+        compensation = ("Not assessable: a respiratory and a metabolic "
+                        "process are both driving pH in the same direction, "
+                        "so neither is compensating for the other.")
+
+    elif primary == "Metabolic acidosis":
+        exp = 1.5 * hco3 + 8
+        lo, hi = exp - WINTERS_TOL, exp + WINTERS_TOL
+        comp_lines.append(f"Winter's formula: expected pCO2 = 1.5 x HCO3 + 8 "
+                          f"= {fmt(exp)} mmHg (range {rng(lo, hi)})")
+        if lo <= pco2 <= hi:
+            compensation = "Adequate (appropriate respiratory compensation)"
+            final = "Metabolic acidosis with appropriate respiratory compensation"
+        elif pco2 > hi:
+            compensation = ("Inadequate: pCO2 higher than expected -> "
+                            "concurrent respiratory acidosis")
+            final = "Metabolic acidosis with concurrent respiratory acidosis"
+        else:
+            compensation = ("Excessive: pCO2 lower than expected -> "
+                            "concurrent respiratory alkalosis")
+            final = "Metabolic acidosis with concurrent respiratory alkalosis"
+        if status == "Normal pH":
+            notes.append("Respiratory compensation for a metabolic acidosis "
+                         "does not normally restore a normal pH; consider a "
+                         "coexisting respiratory or metabolic alkalosis.")
+
+    elif primary == "Metabolic alkalosis":
+        exp = PCO2_MID + 0.7 * (hco3 - HCO3_MID)
+        lo, hi = exp - MET_ALK_TOL, exp + MET_ALK_TOL
+        comp_lines.append(f"Expected pCO2 = 40 + 0.7 x (HCO3 - 24) = "
+                          f"{fmt(exp)} mmHg (range {rng(lo, hi)})")
+        if lo <= pco2 <= hi:
+            compensation = "Adequate (appropriate respiratory compensation)"
+            final = "Metabolic alkalosis with appropriate respiratory compensation"
+        elif pco2 > hi:
+            compensation = ("Excessive: pCO2 higher than expected -> "
+                            "concurrent respiratory acidosis")
+            final = "Metabolic alkalosis with concurrent respiratory acidosis"
+        else:
+            compensation = ("Inadequate: pCO2 lower than expected -> "
+                            "concurrent respiratory alkalosis")
+            final = "Metabolic alkalosis with concurrent respiratory alkalosis"
+        if pco2 > 55:
+            notes.append("Respiratory compensation for a metabolic alkalosis "
+                         "rarely raises pCO2 above ~55 mmHg; a higher pCO2 "
+                         "suggests a coexisting respiratory acidosis.")
+
+    elif primary == "Respiratory acidosis":
+        d = pco2 - PCO2_MID
+        exp_acute = HCO3_MID + 1.0 * d / 10
+        exp_chronic = HCO3_MID + 3.5 * d / 10
+        comp_lines.append(f"Expected HCO3 acute   (+1 per 10 mmHg pCO2)   = "
+                          f"{fmt(exp_acute)} (range "
+                          f"{rng(exp_acute - RESP_TOL, exp_acute + RESP_TOL)})")
+        comp_lines.append(f"Expected HCO3 chronic (+3.5 per 10 mmHg pCO2) = "
+                          f"{fmt(exp_chronic)} (range "
+                          f"{rng(exp_chronic - RESP_TOL, exp_chronic + RESP_TOL)})")
+        if hco3 < exp_acute - RESP_TOL:
+            compensation = ("HCO3 lower than even the acute expectation -> "
+                            "concurrent metabolic acidosis")
+            final = "Respiratory acidosis with concurrent metabolic acidosis"
+        elif hco3 <= exp_acute + RESP_TOL:
+            compensation = ("Acute / uncompensated (renal compensation not "
+                            "yet established)")
+            final = "Acute (uncompensated) respiratory acidosis"
+        elif hco3 < exp_chronic - RESP_TOL:
+            compensation = ("Partial (between acute and chronic expectations "
+                            "-> evolving, or acute-on-chronic)")
+            final = "Partially compensated respiratory acidosis"
+        elif hco3 <= exp_chronic + RESP_TOL:
+            compensation = "Adequate / chronic (full renal compensation)"
+            final = "Chronic (compensated) respiratory acidosis"
+        else:
+            compensation = ("HCO3 higher than the chronic expectation -> "
+                            "concurrent metabolic alkalosis")
+            final = "Respiratory acidosis with concurrent metabolic alkalosis"
+
+    elif primary == "Respiratory alkalosis":
+        d = PCO2_MID - pco2
+        exp_acute = HCO3_MID - 2.0 * d / 10
+        exp_chronic = HCO3_MID - 4.0 * d / 10
+        comp_lines.append(f"Expected HCO3 acute   (-2 per 10 mmHg pCO2) = "
+                          f"{fmt(exp_acute)} (range "
+                          f"{rng(exp_acute - RESP_TOL, exp_acute + RESP_TOL)})")
+        comp_lines.append(f"Expected HCO3 chronic (-4 per 10 mmHg pCO2) = "
+                          f"{fmt(exp_chronic)} (range "
+                          f"{rng(exp_chronic - RESP_TOL, exp_chronic + RESP_TOL)})")
+        if hco3 > exp_acute + RESP_TOL:
+            compensation = ("HCO3 higher than even the acute expectation -> "
+                            "concurrent metabolic alkalosis")
+            final = "Respiratory alkalosis with concurrent metabolic alkalosis"
+        elif hco3 >= exp_acute - RESP_TOL:
+            compensation = ("Acute / uncompensated (renal compensation not "
+                            "yet established)")
+            final = "Acute (uncompensated) respiratory alkalosis"
+        elif hco3 > exp_chronic + RESP_TOL:
+            compensation = ("Partial (between acute and chronic expectations "
+                            "-> evolving, or acute-on-chronic)")
+            final = "Partially compensated respiratory alkalosis"
+        elif hco3 >= exp_chronic - RESP_TOL:
+            compensation = "Adequate / chronic (full renal compensation)"
+            final = "Chronic (compensated) respiratory alkalosis"
+        else:
+            compensation = ("HCO3 lower than the chronic expectation -> "
+                            "concurrent metabolic acidosis")
+            final = "Respiratory alkalosis with concurrent metabolic acidosis"
+
+    # ---- Anion gap (optional) --------------------------------------------
+    ag_lines = []
+    if na is not None and cl is not None:
+        ag = na - (cl + hco3)
+        ag_lines.append(f"Anion gap = Na - (Cl + HCO3) = {fmt(ag)} mEq/L "
+                        f"(normal ~8-12)")
+        ag_use = ag
+        if albumin is not None:
+            ag_use = ag + 2.5 * (4.0 - albumin)
+            ag_lines.append(f"Albumin-corrected AG = AG + 2.5 x (4.0 - alb) = "
+                            f"{fmt(ag_use)} mEq/L")
+        if ag_use > 12:
+            ag_lines.append("Elevated anion gap -> a high anion gap metabolic "
+                            "acidosis (HAGMA) process is present")
+            delta_hco3 = HCO3_MID - hco3
+            if delta_hco3 > 0:
+                ratio = (ag_use - 12) / delta_hco3
+                ag_lines.append(f"Delta ratio = (AG - 12) / (24 - HCO3) = "
+                                f"{fmt(ratio, 2)}")
+                if ratio < 0.4:
+                    ag_lines.append("  < 0.4 -> hyperchloraemic (normal AG) "
+                                    "acidosis predominates")
+                elif ratio < 0.8:
+                    ag_lines.append("  0.4-0.8 -> combined HAGMA and normal "
+                                    "AG metabolic acidosis")
+                elif ratio <= 2.0:
+                    ag_lines.append("  0.8-2.0 -> pure HAGMA")
+                else:
+                    ag_lines.append("  > 2.0 -> HAGMA with concurrent "
+                                    "metabolic alkalosis (or a pre-existing "
+                                    "high HCO3, e.g. chronic resp. acidosis)")
+            else:
+                ag_lines.append("Raised AG without a fall in HCO3 -> "
+                                "consider a concurrent metabolic alkalosis")
+        elif "etabolic acidosis" in final:
+            ag_lines.append("Normal anion gap -> normal anion gap "
+                            "(hyperchloraemic) metabolic acidosis")
+        else:
+            ag_lines.append("Anion gap within normal limits")
+    elif (na is None) != (cl is None):
+        notes.append("Both --na and --cl are needed to calculate an anion gap.")
+
+    # ---- Oxygenation -----------------------------------------------------
+    oxy_lines = []
+    if vbg:
+        oxy_lines.append(f"Venous pO2 {fmt(po2)} mmHg (venous normal ~35-45): "
+                         "venous pO2 does NOT reflect arterial oxygenation; "
+                         "use SpO2 or an arterial sample.")
+        notes.append("Venous sample: compared with arterial blood, venous pH "
+                     "runs ~0.03-0.05 lower and pCO2 ~4-6 mmHg higher; HCO3 "
+                     "is comparable. Values were interpreted as entered, "
+                     "without conversion. A borderline respiratory acidosis "
+                     "on a VBG should be confirmed with an ABG.")
+    else:
+        if po2 >= 80:
+            oxy_lines.append(f"pO2 {fmt(po2)} mmHg: normal oxygenation")
+        elif po2 >= 60:
+            oxy_lines.append(f"pO2 {fmt(po2)} mmHg: mild hypoxaemia")
+        elif po2 >= 40:
+            oxy_lines.append(f"pO2 {fmt(po2)} mmHg: moderate hypoxaemia")
+        else:
+            oxy_lines.append(f"pO2 {fmt(po2)} mmHg: severe hypoxaemia")
+        if age is not None or fio2 is not None:
+            f = 0.21 if fio2 is None else fio2
+            pao2 = f * (760 - 47) - pco2 / 0.8
+            aa = pao2 - po2
+            line = (f"A-a gradient (FiO2 {fmt(f, 2)}): PAO2 {fmt(pao2)} - "
+                    f"PaO2 {fmt(po2)} = {fmt(aa)} mmHg")
+            if age is not None:
+                exp_aa = age / 4 + 4
+                line += f"; expected for age ~{fmt(exp_aa)}"
+                if aa > exp_aa + 2:
+                    line += (" -> ELEVATED (V/Q mismatch, shunt, or "
+                             "diffusion defect)")
+                else:
+                    line += (" -> normal (any hypoxaemia is from "
+                             "hypoventilation or low FiO2)")
+            oxy_lines.append(line)
+
+    # ---- Assemble report -------------------------------------------------
+    sample = "VBG" if vbg else "ABG"
+    out.append(f"{sample} analysis")
+    out.append(f"  pH {fmt(ph, 2)} | pCO2 {fmt(pco2)} mmHg | pO2 {fmt(po2)} mmHg "
+               f"| HCO3 {fmt(hco3)} mEq/L")
+    out.append("")
+    out.append(f"pH status ........ {status}")
+    out.append(f"Primary disorder . {primary}")
+    for c in comp_lines:
+        out.append(f"                   {c}")
+    out.append(f"Compensation ..... {compensation}")
+    out.append("")
+    out.append(f"INTERPRETATION:    {final}")
+    if ag_lines:
+        out.append("")
+        out.append("Anion gap:")
+        for a in ag_lines:
+            out.append(f"  {a}")
+    out.append("")
+    out.append("Oxygenation:")
+    for o in oxy_lines:
+        out.append(f"  {o}")
+    if notes:
+        out.append("")
+        out.append("Notes:")
+        for n in notes:
+            out.append(f"  - {n}")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def prompt_float(label, lo, hi):
+    while True:
+        try:
+            raw = input(f"{label}: ").strip()
+        except EOFError:
+            sys.exit("\nNo input; aborting.")
+        try:
+            v = float(raw)
+        except ValueError:
+            print(f"  Please enter a number for {label}.")
+            continue
+        if not (lo <= v <= hi):
+            print(f"  {label} must be between {lo} and {hi}.")
+            continue
+        return v
+
+
+def check_range(name, v, lo, hi):
+    if v is not None and not (lo <= v <= hi):
+        sys.exit(f"error: {name} = {v} is outside the plausible range "
+                 f"{lo}-{hi}.")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="ABG", add_help=False,
+        description="Simple ABG / VBG acid-base analyzer.")
+    p.add_argument("values", nargs="*", type=float,
+                   help="pH pCO2 pO2 HCO3 (positional, in that order)")
+    p.add_argument("--ph", type=float)
+    p.add_argument("--pco2", type=float)
+    p.add_argument("--po2", type=float)
+    p.add_argument("--hco3", type=float)
+    p.add_argument("--vbg", action="store_true")
+    p.add_argument("--na", type=float)
+    p.add_argument("--cl", type=float)
+    p.add_argument("--albumin", type=float)
+    p.add_argument("--age", type=float)
+    p.add_argument("--fio2", type=float)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args(argv)
+
+    if a.help:
+        print(__doc__.strip())
+        return 0
+
+    vals = list(a.values)
+    if vals and len(vals) != 4:
+        sys.exit("error: give exactly four positional values: pH pCO2 pO2 HCO3")
+    ph = a.ph if a.ph is not None else (vals[0] if vals else None)
+    pco2 = a.pco2 if a.pco2 is not None else (vals[1] if vals else None)
+    po2 = a.po2 if a.po2 is not None else (vals[2] if vals else None)
+    hco3 = a.hco3 if a.hco3 is not None else (vals[3] if vals else None)
+
+    if any(v is None for v in (ph, pco2, po2, hco3)):
+        print("ABG / VBG analyzer - enter values (Ctrl+C to quit)")
+        try:
+            if ph is None:
+                ph = prompt_float("pH", 6.5, 8.0)
+            if pco2 is None:
+                pco2 = prompt_float("pCO2 (mmHg)", 5, 200)
+            if po2 is None:
+                po2 = prompt_float("pO2 (mmHg)", 5, 700)
+            if hco3 is None:
+                hco3 = prompt_float("HCO3 (mEq/L)", 1, 70)
+        except KeyboardInterrupt:
+            print()
+            return 130
+        print()
+
+    check_range("pH", ph, 6.5, 8.0)
+    check_range("pCO2", pco2, 5, 200)
+    check_range("pO2", po2, 5, 700)
+    check_range("HCO3", hco3, 1, 70)
+    check_range("FiO2", a.fio2, 0.21, 1.0)
+
+    print(analyze(ph, pco2, po2, hco3, vbg=a.vbg, na=a.na, cl=a.cl,
+                  albumin=a.albumin, age=a.age, fio2=a.fio2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
