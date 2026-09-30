@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""
+MetAcid - a metabolic acidosis calculator.
+
+Usage:
+    ./MetAcid <pH> <pCO2> <HCO3> <Na> <Cl> [options]
+    ./MetAcid <HCO3> <Na> <Cl> [options]          (no blood gas)
+    ./MetAcid --hco3 12 --na 138 --cl 102 --albumin 2.5
+    ./MetAcid                                     (interactive prompts)
+
+Options:
+    --ph <pH>              pH             (acidemia, consistency check)
+    --pco2 <mmHg>          pCO2           (Winter's formula)
+    --hco3 <mEq/L>         bicarbonate
+    --na <mEq/L>           sodium
+    --cl <mEq/L>           chloride
+    --albumin <g/dL>       albumin        (corrects the anion gap)
+    --k <mEq/L>            serum potassium (normal-AG acidosis workup)
+    --osm <mOsm/kg>        measured serum osmolality  } osmolar gap
+    --glucose <mg/dL>      glucose                    } (all three
+    --bun <mg/dL>          blood urea nitrogen        }  needed)
+    --ethanol <mg/dL>      ethanol (added to the calculated osmolality)
+    --una <mEq/L>          urine sodium     } urine anion gap
+    --uk <mEq/L>           urine potassium  } (all three
+    --ucl <mEq/L>          urine chloride   }  needed)
+    --weight <kg>          body weight    (bicarbonate deficit)
+    --target-hco3 <mEq/L>  target HCO3 for the deficit (default 24)
+    -h, --help             show this help
+
+Units: pCO2 in mmHg; HCO3 and electrolytes in mEq/L; albumin in g/dL;
+glucose, BUN and ethanol in mg/dL.
+"""
+
+import argparse
+import sys
+
+# --------------------------------------------------------------------------
+# Reference ranges and thresholds (shared ones match ./ABG)
+# --------------------------------------------------------------------------
+PH_LOW, PH_HIGH, PH_MID = 7.35, 7.45, 7.40
+PCO2_LOW = 35.0
+HCO3_LOW, HCO3_MID = 22.0, 24.0
+AG_NORMAL = 12.0       # upper limit of a normal anion gap (mEq/L)
+ALB_NORMAL = 4.0       # g/dL
+K_LOW, K_HIGH = 3.5, 5.0
+OSM_GAP_HIGH = 10.0    # mOsm/kg
+URINE_NA_LOW = 20.0    # mEq/L; below this the urine anion gap is unreliable
+HCO3_SPACE = 0.5       # apparent bicarbonate space, L/kg
+
+WINTERS_TOL = 2.0      # pCO2 = 1.5*HCO3 + 8 +/- 2
+HH_TOL = 3.0           # Henderson-Hasselbalch consistency tolerance (mEq/L)
+
+
+def fmt(x, nd=1):
+    return f"{x:.{nd}f}"
+
+
+def rng(lo, hi, nd=1):
+    return f"{fmt(lo, nd)}-{fmt(hi, nd)}"
+
+
+# --------------------------------------------------------------------------
+# Core analysis
+# --------------------------------------------------------------------------
+def analyze(hco3, na, cl, ph=None, pco2=None, albumin=None, k=None,
+            osm=None, glucose=None, bun=None, ethanol=None,
+            una=None, uk=None, ucl=None, weight=None, target_hco3=HCO3_MID):
+    out = []          # lines of report
+    notes = []        # caveats
+    comp_lines = []   # Winter's formula detail
+
+    # ---- Henderson-Hasselbalch internal consistency ----------------------
+    if ph is not None and pco2 is not None:
+        hco3_calc = 0.03 * pco2 * 10 ** (ph - 6.1)
+        if abs(hco3_calc - hco3) > HH_TOL:
+            notes.append(
+                f"Values are internally inconsistent: from pH and pCO2 the "
+                f"expected HCO3 is ~{fmt(hco3_calc)} mEq/L but {fmt(hco3)} was "
+                f"entered (difference > {fmt(HH_TOL, 0)}). Check for a "
+                f"transcription error or sampling problem; the interpretation "
+                f"below may be unreliable.")
+
+    # ---- Anion gap and delta ratio ---------------------------------------
+    low_hco3 = hco3 < HCO3_LOW
+    ag = na - (cl + hco3)
+    ag_lines = [f"Anion gap = Na - (Cl + HCO3) = {fmt(ag)} mEq/L "
+                f"(normal ~8-12)"]
+    ag_use = ag
+    if albumin is not None:
+        ag_use = ag + 2.5 * (ALB_NORMAL - albumin)
+        ag_lines.append(f"Albumin-corrected AG = AG + 2.5 x (4.0 - alb) = "
+                        f"{fmt(ag_use)} mEq/L")
+    high_ag = ag_use > AG_NORMAL
+    normal_ag_component = False
+    met_alk = False
+
+    if high_ag:
+        ag_lines.append("Elevated -> a high anion gap metabolic acidosis "
+                        "(HAGMA) process is present")
+        delta_hco3 = HCO3_MID - hco3
+        if delta_hco3 > 0:
+            ratio = (ag_use - AG_NORMAL) / delta_hco3
+            ag_lines.append(f"Delta ratio = (AG - 12) / (24 - HCO3) = "
+                            f"{fmt(ratio, 2)}")
+            if ratio < 0.4:
+                ag_lines.append("  < 0.4 -> hyperchloraemic (normal AG) "
+                                "acidosis predominates")
+                normal_ag_component = True
+                metabolic = ("Mixed normal and high anion gap metabolic "
+                             "acidosis (mainly normal AG)")
+            elif ratio < 0.8:
+                ag_lines.append("  0.4-0.8 -> combined HAGMA and normal AG "
+                                "metabolic acidosis")
+                normal_ag_component = True
+                metabolic = ("Mixed high and normal anion gap metabolic "
+                             "acidosis")
+            elif ratio <= 2.0:
+                ag_lines.append("  0.8-2.0 -> pure HAGMA")
+                metabolic = "High anion gap metabolic acidosis"
+            else:
+                ag_lines.append("  > 2.0 -> HAGMA with concurrent metabolic "
+                                "alkalosis (or a pre-existing high HCO3, "
+                                "e.g. chronic resp. acidosis)")
+                met_alk = True
+                metabolic = "High anion gap metabolic acidosis"
+        else:
+            ag_lines.append("Raised AG without a fall in HCO3 -> a concurrent "
+                            "metabolic alkalosis is masking the acidosis")
+            met_alk = True
+            metabolic = "High anion gap metabolic acidosis"
+    elif low_hco3:
+        ag_lines.append("Normal anion gap -> normal anion gap "
+                        "(hyperchloraemic) metabolic acidosis")
+        normal_ag_component = True
+        metabolic = "Normal anion gap (hyperchloraemic) metabolic acidosis"
+        if albumin is None:
+            notes.append("No albumin given: each 1 g/dL fall in albumin "
+                         "lowers the anion gap by ~2.5 mEq/L, so "
+                         "hypoalbuminaemia can hide a HAGMA. Add --albumin "
+                         "to correct for it.")
+    else:
+        ag_lines.append("Anion gap within normal limits")
+        metabolic = None
+
+    acidosis = metabolic is not None
+    pure_nagma = low_hco3 and not high_ag
+
+    if low_hco3:
+        acid_status = f"Present (HCO3 {fmt(hco3)} < 22 mEq/L)"
+    elif high_ag:
+        acid_status = (f"Present (raised anion gap, although HCO3 "
+                       f"{fmt(hco3)} mEq/L is not low)")
+    else:
+        acid_status = "Not detected (HCO3 not low, anion gap normal)"
+
+    # ---- Respiratory compensation (Winter's formula) ---------------------
+    resp = None
+    if pco2 is None:
+        compensation = "Not assessed (no pCO2 given)"
+    elif not low_hco3:
+        compensation = "Not applicable (HCO3 not low)"
+    else:
+        exp = 1.5 * hco3 + 8
+        lo, hi = exp - WINTERS_TOL, exp + WINTERS_TOL
+        comp_lines.append(f"Winter's formula: expected pCO2 = 1.5 x HCO3 + 8 "
+                          f"= {fmt(exp)} mmHg (range {rng(lo, hi)})")
+        if lo <= pco2 <= hi:
+            compensation = "Adequate (appropriate respiratory compensation)"
+            resp = "appropriate respiratory compensation"
+        elif pco2 > hi:
+            compensation = ("Inadequate: pCO2 higher than expected -> "
+                            "concurrent respiratory acidosis")
+            resp = "concurrent respiratory acidosis"
+        else:
+            compensation = ("Excessive: pCO2 lower than expected -> "
+                            "concurrent respiratory alkalosis")
+            resp = "concurrent respiratory alkalosis"
+
+    # ---- pH ----------------------------------------------------------------
+    status = None
+    if ph is not None:
+        if ph < PH_LOW:
+            status = "Acidemia"
+        elif ph > PH_HIGH:
+            status = "Alkalemia"
+        else:
+            status = "Normal pH"
+        if (pure_nagma and ph > PH_MID and pco2 is not None
+                and pco2 < PCO2_LOW):
+            notes.append("pH is on the alkaline side of 7.40 with a low "
+                         "pCO2: the low HCO3 may be renal compensation for a "
+                         "primary respiratory alkalosis rather than a "
+                         "metabolic acidosis. Run ./ABG for the full "
+                         "primary-disorder analysis.")
+        if (low_hco3 and status == "Normal pH"
+                and resp == "appropriate respiratory compensation"):
+            notes.append("Respiratory compensation for a metabolic acidosis "
+                         "does not normally restore a normal pH; consider a "
+                         "coexisting respiratory or metabolic alkalosis.")
+        if status == "Acidemia" and not low_hco3:
+            notes.append("Acidemia without a low HCO3 points to a primary "
+                         "respiratory acidosis; run ./ABG for the full "
+                         "analysis.")
+    elif pure_nagma:
+        notes.append("No pH given: a low HCO3 with a normal anion gap can "
+                     "also be renal compensation for a chronic respiratory "
+                     "alkalosis. Confirm with a blood gas.")
+
+    if acidosis:
+        clauses = []
+        if met_alk:
+            clauses.append("concurrent metabolic alkalosis")
+        if resp:
+            clauses.append(resp)
+        final = metabolic
+        if clauses:
+            final += " with " + " and ".join(clauses)
+    else:
+        final = "No metabolic acidosis detected"
+
+    # ---- Osmolar gap (optional) ------------------------------------------
+    osm_lines = []
+    osm_inputs = (osm, glucose, bun)
+    if all(v is not None for v in osm_inputs):
+        calc = 2 * na + glucose / 18 + bun / 2.8
+        formula = "2 x Na + glucose/18 + BUN/2.8"
+        if ethanol is not None:
+            calc += ethanol / 3.7
+            formula += " + EtOH/3.7"
+        gap = osm - calc
+        osm_lines.append(f"Calculated osmolality = {formula} = {fmt(calc)} "
+                         f"mOsm/kg")
+        osm_lines.append(f"Osmolar gap = measured - calculated = {fmt(osm)} - "
+                         f"{fmt(calc)} = {fmt(gap)} mOsm/kg (normal <= 10)")
+        if gap > OSM_GAP_HIGH:
+            causes = "methanol, ethylene glycol, "
+            if ethanol is None:
+                causes += "ethanol, "
+            causes += "isopropanol, propylene glycol, mannitol"
+            osm_lines.append("Elevated -> unmeasured osmoles present")
+            osm_lines.append(f"  Consider: {causes}")
+            osm_lines.append("  (ketoacidosis and lactic acidosis can raise "
+                             "it modestly)")
+            if high_ag:
+                osm_lines.append("HAGMA + raised osmolar gap: toxic alcohol "
+                                 "poisoning (methanol / ethylene glycol) "
+                                 "must be excluded - seek toxicology advice")
+        else:
+            osm_lines.append("Normal -> no large unmeasured osmole load")
+            if high_ag:
+                osm_lines.append("  A normal gap does not exclude a toxic "
+                                 "alcohol late after ingestion, once it has "
+                                 "been metabolised to acids")
+    elif any(v is not None for v in osm_inputs):
+        notes.append("The osmolar gap needs all of --osm, --glucose and "
+                     "--bun.")
+
+    # ---- Urine anion gap (optional) --------------------------------------
+    uag_lines = []
+    urine_inputs = (una, uk, ucl)
+    if all(v is not None for v in urine_inputs):
+        uag = una + uk - ucl
+        uag_lines.append(f"Urine AG = UNa + UK - UCl = {fmt(una)} + {fmt(uk)} "
+                         f"- {fmt(ucl)} = {fmt(uag)} mEq/L")
+        if not pure_nagma:
+            uag_lines.append("Not interpreted: the urine anion gap is only "
+                             "valid in a normal anion gap metabolic acidosis")
+        elif uag < 0:
+            uag_lines.append("Negative -> urinary NH4+ excretion is "
+                             "appropriate: GI (extrarenal) bicarbonate loss "
+                             "likely")
+            uag_lines.append("  e.g. diarrhoea, fistula, ileostomy; proximal "
+                             "(type 2) RTA can also give a negative UAG")
+        else:
+            uag_lines.append("Positive -> urinary NH4+ excretion is impaired: "
+                             "renal cause (RTA or CKD)")
+            if k is None:
+                uag_lines.append("  Add --k to separate type 1 (low K) from "
+                                 "type 4 (high K) RTA")
+            elif k > K_HIGH:
+                uag_lines.append(f"  K {fmt(k)} (high) -> type 4 RTA "
+                                 f"(hypoaldosteronism / aldosterone "
+                                 f"resistance) or CKD")
+            elif k < K_LOW:
+                uag_lines.append(f"  K {fmt(k)} (low) -> distal (type 1) RTA")
+            else:
+                uag_lines.append(f"  K {fmt(k)} (normal) -> distal (type 1) "
+                                 f"or type 4 RTA; a urine pH > 5.5 favours "
+                                 f"type 1")
+            notes.append("Unmeasured urinary anions (ketones, D-lactate, "
+                         "hippurate from toluene, penicillins) make the urine "
+                         "anion gap positive even when NH4+ excretion is "
+                         "normal.")
+        if pure_nagma and una < URINE_NA_LOW:
+            notes.append(f"Urine Na {fmt(una)} < {fmt(URINE_NA_LOW, 0)} "
+                         f"mEq/L: low distal sodium delivery limits NH4+ "
+                         f"excretion, so the urine anion gap is unreliable "
+                         f"(it may be falsely positive).")
+    elif any(v is not None for v in urine_inputs):
+        notes.append("The urine anion gap needs all of --una, --uk and "
+                     "--ucl.")
+
+    # ---- Causes to consider ----------------------------------------------
+    ddx_lines = []
+    if high_ag:
+        tests = ["lactate", "ketones (BHB)", "glucose", "creatinine / urea",
+                 "salicylate", "paracetamol"]
+        if osm is None:
+            tests.append("serum osmolality")
+        ddx_lines.append("High anion gap (GOLDMARK):")
+        ddx_lines.append("  Glycols (ethylene / propylene), 5-Oxoproline "
+                         "(chronic paracetamol), L-lactate, D-lactate,")
+        ddx_lines.append("  Methanol, Aspirin (salicylate), Renal failure, "
+                         "Ketoacidosis (diabetic / alcoholic / starvation)")
+        ddx_lines.append(f"  Check: {', '.join(tests)}")
+    if normal_ag_component:
+        tests = []
+        if pure_nagma and not all(v is not None for v in urine_inputs):
+            tests.append("urine Na, K, Cl (urine anion gap)")
+        if k is None:
+            tests.append("serum K")
+        tests.append("urine pH")
+        ddx_lines.append("Normal anion gap:")
+        ddx_lines.append("  GI bicarbonate loss (diarrhoea, fistula, "
+                         "ileostomy, ureteral diversion), renal tubular")
+        ddx_lines.append("  acidosis (types 1, 2, 4), chloride load "
+                         "(large-volume 0.9% saline), carbonic anhydrase")
+        ddx_lines.append("  inhibitors (acetazolamide, topiramate), early "
+                         "CKD, DKA recovery phase")
+        if k is not None and not uag_lines:
+            if k < K_LOW:
+                ddx_lines.append(f"  K {fmt(k)} (low) favours GI loss or "
+                                 f"type 1 / type 2 RTA")
+            elif k > K_HIGH:
+                ddx_lines.append(f"  K {fmt(k)} (high) favours type 4 RTA "
+                                 f"(hypoaldosteronism) or CKD")
+        ddx_lines.append(f"  Check: {', '.join(tests)}")
+
+    # ---- Bicarbonate deficit (optional) ----------------------------------
+    deficit_lines = []
+    if weight is not None:
+        if hco3 >= target_hco3:
+            deficit_lines.append(f"HCO3 is already at or above the target of "
+                                 f"{fmt(target_hco3)} mEq/L; no deficit")
+        else:
+            deficit = HCO3_SPACE * weight * (target_hco3 - hco3)
+            deficit_lines.append(f"Deficit = 0.5 x weight x (target - HCO3) "
+                                 f"= 0.5 x {fmt(weight)} x "
+                                 f"({fmt(target_hco3)} - {fmt(hco3)}) = "
+                                 f"{fmt(deficit, 0)} mEq")
+            notes.append("Bicarbonate deficit: the ~0.5 L/kg bicarbonate "
+                         "space rises as HCO3 falls, so the deficit is "
+                         "underestimated in severe acidosis. Bicarbonate "
+                         "therapy is of unproven benefit in DKA and most "
+                         "lactic acidosis; when it is used it is usually a "
+                         "partial correction guided by repeat gases. This "
+                         "figure is not a dosing instruction.")
+
+    # ---- Assemble report -------------------------------------------------
+    shown = []
+    if ph is not None:
+        shown.append(f"pH {fmt(ph, 2)}")
+    if pco2 is not None:
+        shown.append(f"pCO2 {fmt(pco2)} mmHg")
+    shown.append(f"HCO3 {fmt(hco3)}")
+    shown.append(f"Na {fmt(na)}")
+    shown.append(f"Cl {fmt(cl)}")
+    if k is not None:
+        shown.append(f"K {fmt(k)}")
+    shown[-1] += " mEq/L"
+    if albumin is not None:
+        shown.append(f"albumin {fmt(albumin)} g/dL")
+
+    out.append("Metabolic acidosis workup")
+    out.append("  " + " | ".join(shown))
+    out.append("")
+    if status is not None:
+        out.append(f"pH status ........ {status}")
+    out.append(f"Met. acidosis .... {acid_status}")
+    for c in comp_lines:
+        out.append(f"                   {c}")
+    out.append(f"Compensation ..... {compensation}")
+    out.append("")
+    out.append("Anion gap:")
+    for a in ag_lines:
+        out.append(f"  {a}")
+    if osm_lines:
+        out.append("")
+        out.append("Osmolar gap:")
+        for o in osm_lines:
+            out.append(f"  {o}")
+    if uag_lines:
+        out.append("")
+        out.append("Urine anion gap:")
+        for u in uag_lines:
+            out.append(f"  {u}")
+    out.append("")
+    out.append(f"INTERPRETATION:    {final}")
+    if ddx_lines:
+        out.append("")
+        out.append("Causes to consider:")
+        for d in ddx_lines:
+            out.append(f"  {d}")
+    if deficit_lines:
+        out.append("")
+        out.append(f"Bicarbonate deficit (target HCO3 {fmt(target_hco3)} "
+                   f"mEq/L):")
+        for d in deficit_lines:
+            out.append(f"  {d}")
+    if notes:
+        out.append("")
+        out.append("Notes:")
+        for n in notes:
+            out.append(f"  - {n}")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+def prompt_float(label, lo, hi, optional=False):
+    while True:
+        try:
+            raw = input(f"{label}: ").strip()
+        except EOFError:
+            sys.exit("\nNo input; aborting.")
+        if optional and not raw:
+            return None
+        try:
+            v = float(raw)
+        except ValueError:
+            print(f"  Please enter a number for {label}.")
+            continue
+        if not (lo <= v <= hi):
+            print(f"  {label} must be between {lo} and {hi}.")
+            continue
+        return v
+
+
+def check_range(name, v, lo, hi):
+    if v is not None and not (lo <= v <= hi):
+        sys.exit(f"error: {name} = {v} is outside the plausible range "
+                 f"{lo}-{hi}.")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="MetAcid", add_help=False,
+        description="Metabolic acidosis calculator.")
+    p.add_argument("values", nargs="*", type=float,
+                   help="pH pCO2 HCO3 Na Cl, or HCO3 Na Cl (positional)")
+    p.add_argument("--ph", type=float)
+    p.add_argument("--pco2", type=float)
+    p.add_argument("--hco3", type=float)
+    p.add_argument("--na", type=float)
+    p.add_argument("--cl", type=float)
+    p.add_argument("--albumin", type=float)
+    p.add_argument("--k", type=float)
+    p.add_argument("--osm", type=float)
+    p.add_argument("--glucose", type=float)
+    p.add_argument("--bun", type=float)
+    p.add_argument("--ethanol", type=float)
+    p.add_argument("--una", type=float)
+    p.add_argument("--uk", type=float)
+    p.add_argument("--ucl", type=float)
+    p.add_argument("--weight", type=float)
+    p.add_argument("--target-hco3", type=float, default=HCO3_MID)
+    p.add_argument("-h", "--help", action="store_true")
+    a = p.parse_args(argv)
+
+    if a.help:
+        print(__doc__.strip())
+        return 0
+
+    vals = list(a.values)
+    if len(vals) == 5:
+        pos = dict(zip(("ph", "pco2", "hco3", "na", "cl"), vals))
+    elif len(vals) == 3:
+        pos = dict(zip(("hco3", "na", "cl"), vals))
+    elif vals:
+        sys.exit("error: give five positional values (pH pCO2 HCO3 Na Cl) "
+                 "or three (HCO3 Na Cl)")
+    else:
+        pos = {}
+
+    def pick(name):
+        v = getattr(a, name)
+        return v if v is not None else pos.get(name)
+
+    ph, pco2, hco3, na, cl = (pick(n) for n in
+                              ("ph", "pco2", "hco3", "na", "cl"))
+    albumin = a.albumin
+
+    if any(v is None for v in (hco3, na, cl)):
+        print("Metabolic acidosis calculator - enter values "
+              "(Enter skips optional ones, Ctrl+C to quit)")
+        try:
+            if ph is None:
+                ph = prompt_float("pH (optional)", 6.5, 8.0, optional=True)
+            if pco2 is None:
+                pco2 = prompt_float("pCO2 (mmHg, optional)", 5, 200,
+                                    optional=True)
+            if hco3 is None:
+                hco3 = prompt_float("HCO3 (mEq/L)", 1, 70)
+            if na is None:
+                na = prompt_float("Na (mEq/L)", 100, 200)
+            if cl is None:
+                cl = prompt_float("Cl (mEq/L)", 50, 150)
+            if albumin is None:
+                albumin = prompt_float("Albumin (g/dL, optional)", 0.5, 6.5,
+                                       optional=True)
+        except KeyboardInterrupt:
+            print()
+            return 130
+        print()
+
+    if albumin is not None and albumin > 10:
+        sys.exit(f"error: albumin = {albumin} looks like g/L; enter it in "
+                 f"g/dL (e.g. 30 g/L = 3.0 g/dL).")
+    check_range("pH", ph, 6.5, 8.0)
+    check_range("pCO2", pco2, 5, 200)
+    check_range("HCO3", hco3, 1, 70)
+    check_range("Na", na, 100, 200)
+    check_range("Cl", cl, 50, 150)
+    check_range("albumin", albumin, 0.5, 6.5)
+    check_range("K", a.k, 1, 10)
+    check_range("osmolality", a.osm, 200, 500)
+    check_range("glucose", a.glucose, 10, 3000)
+    check_range("BUN", a.bun, 1, 300)
+    check_range("ethanol", a.ethanol, 0, 1000)
+    check_range("urine Na", a.una, 0, 400)
+    check_range("urine K", a.uk, 0, 400)
+    check_range("urine Cl", a.ucl, 0, 400)
+    check_range("weight", a.weight, 1, 400)
+    check_range("target HCO3", a.target_hco3, 5, 40)
+
+    print(analyze(hco3, na, cl, ph=ph, pco2=pco2, albumin=albumin, k=a.k,
+                  osm=a.osm, glucose=a.glucose, bun=a.bun,
+                  ethanol=a.ethanol, una=a.una, uk=a.uk, ucl=a.ucl,
+                  weight=a.weight, target_hco3=a.target_hco3))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
